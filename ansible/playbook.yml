@@ -1,0 +1,192 @@
+---
+# Thin Ansible orchestrator for EC2.
+# All runtime-specific behavior lives in `runtimes/<runtime>/*.yml.j2` so that
+# editing one language's playbook (e.g. python) cannot affect any other.
+- name: Deploy cspringit1
+  hosts: all
+  become: true
+  gather_facts: yes
+  vars:
+    ansible_ssh_retries: 5
+    app_dir: /opt/app
+    app_port: 8080
+    project: 'cspringit1'
+    web_server: 'nginx'
+    docker_image: '{{ docker_image }}'
+    ghcr_actor: '{{ ghcr_actor }}'
+    ghcr_token: '{{ ghcr_token }}'
+    java_version: '21'
+
+  tasks:
+    # ── System update ──────────────────────────────────────────────────────────
+    - name: Wait for SSH to be fully ready
+      wait_for_connection:
+        timeout: 120
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      retries: 3
+      delay: 10
+      register: _apt_update
+      until: _apt_update is succeeded
+
+
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Configure Nginx reverse proxy
+      copy:
+        dest: /etc/nginx/sites-available/app
+        content: |
+          server {
+            listen 80;
+            server_name _;
+            location / {
+              proxy_pass http://127.0.0.1:{{ app_port }};
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_read_timeout 120s;
+            }
+          }
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/app
+        dest: /etc/nginx/sites-enabled/app
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+
+    # ── App directory ─────────────────────────────────────────────────────────
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: '0755'
+
+    # ── Docker (GHCR) ─────────────────────────────────────────────────────────
+    - name: Install Docker
+      shell: |
+        curl -fsSL https://get.docker.com | sh
+      args:
+        executable: /bin/bash
+        creates: /usr/bin/docker
+
+    - name: Login to GHCR
+      shell: |
+        echo "{{ ghcr_token }}" | docker login ghcr.io -u "{{ ghcr_actor }}" --password-stdin
+      args:
+        executable: /bin/bash
+      no_log: true
+
+    - name: Pull image from GHCR
+      shell: docker pull "{{ docker_image }}"
+      args:
+        executable: /bin/bash
+
+    # ── Resolve Spring-shaped JDBC connection details from the deploy env ────
+    # The deploy pipeline passes DATABASE_URL in scheme-prefixed form
+    # (postgres://user:pass@host:5432/db). Spring's JDBC driver wants
+    # "jdbc:postgresql://host:5432/db" plus separate username/password.
+    # This block runs the translation once and stores the result in three
+    # Ansible facts so both the systemd .env writer and the `docker run`
+    # invocation can consume them without duplicating the parsing logic.
+    - name: Resolve Spring JDBC URL + credentials from deploy env
+      shell: |
+        set -e
+        DB_URL_RAW="{{ lookup('env', 'DATABASE_URL') | default('', true) }}"
+        DB_USER="{{ lookup('env', 'DB_USERNAME') | default('appuser', true) }}"
+        DB_PASS="{{ lookup('env', 'DB_PASSWORD') | default('', true) }}"
+        DB_NAME="{{ lookup('env', 'DB_NAME') | default(project | replace('-', '_') + 'db', true) }}"
+
+        if [ -n "$DB_URL_RAW" ]; then
+          PROTO="$(echo "$DB_URL_RAW" | sed -E 's|^([a-z]+)://.*|\1|')"
+          REST="$(echo "$DB_URL_RAW" | sed -E 's|^[a-z]+://([^/]+)/(.+)$|\1|')"
+          DBPART="$(echo "$DB_URL_RAW" | sed -E 's|^[a-z]+://([^/]+)/(.+)$|\2|')"
+          HOSTPORT="$(echo "$REST" | sed -E 's|^[^@]+@||')"
+          if echo "$REST" | grep -q '@'; then
+            EMBED_USER="$(echo "$REST" | sed -E 's|^([^:@]+).*|\1|')"
+            EMBED_PASS="$(echo "$REST" | sed -E 's|^[^:]+:([^@]+)@.*|\1|')"
+            [ -z "$DB_USER" ] && DB_USER="$EMBED_USER"
+            [ -z "$DB_PASS" ] && DB_PASS="$EMBED_PASS"
+          fi
+          [ -n "$DBPART" ] && DB_NAME="$DBPART"
+          case "$PROTO" in
+            postgres|postgresql) JDBC="jdbc:postgresql://$HOSTPORT/$DB_NAME" ;;
+            mysql)               JDBC="jdbc:mysql://$HOSTPORT/$DB_NAME" ;;
+            *)                   JDBC="jdbc:$PROTO://$HOSTPORT/$DB_NAME" ;;
+          esac
+        else
+          # No DATABASE_URL provided — fall back to localhost (install_db=local).
+          JDBC="jdbc:postgresql://localhost:5432/$DB_NAME"
+        fi
+        # Emit the resolved values as JSON for the next task to pick up as facts.
+        printf '{"spring_datasource_url":"%s","spring_datasource_username":"%s","spring_datasource_password":"%s"}\n' \
+               "$JDBC" "$DB_USER" "$DB_PASS"
+      args:
+        executable: /bin/bash
+      register: _jdbc_resolve
+      no_log: true
+      changed_when: false
+
+    - name: Store JDBC details as facts
+      set_fact:
+        spring_datasource_url:      "{{ (_jdbc_resolve.stdout | from_json).spring_datasource_url }}"
+        spring_datasource_username: "{{ (_jdbc_resolve.stdout | from_json).spring_datasource_username }}"
+        spring_datasource_password: "{{ (_jdbc_resolve.stdout | from_json).spring_datasource_password }}"
+      no_log: true
+
+    # Build the docker run env-var list. We use --env-file pointed at a file
+    # we generate just-in-time so passwords never appear on the command line
+    # (which would land in /var/log + `docker inspect`).
+    - name: Write docker env file
+      copy:
+        dest: "/opt/app.env"
+        mode: '0600'
+        content: |
+          PORT={{ app_port }}
+          SPRING_DATASOURCE_URL={{ spring_datasource_url }}
+          SPRING_DATASOURCE_USERNAME={{ spring_datasource_username }}
+          SPRING_DATASOURCE_PASSWORD={{ spring_datasource_password }}
+          SPRING_JPA_HIBERNATE_DDL_AUTO=update
+          SERVER_PORT={{ app_port }}
+          SPRING_PROFILES_ACTIVE=production
+      no_log: true
+
+    - name: Run container
+      shell: |
+        docker rm -f {{ project }} 2>/dev/null || true
+        docker run -d \
+          --name {{ project }} \
+          --restart always \
+          --network host \
+          --env-file /opt/app.env \
+          "{{ docker_image }}"
+      args:
+        executable: /bin/bash
+
+    - name: Reload and start web server
+      service:
+        name: "{{ 'apache2' if (web_server or 'nginx').lower() == 'apache' else 'nginx' }}"
+        state: reloaded
+        enabled: yes
+
+  handlers:
+    - name: Restart app
+      shell: |
+        docker rm -f {{ project }} 2>/dev/null || true
+        docker run -d --name {{ project }} --restart always --network host \
+          --env-file /opt/app.env "{{ docker_image }}"
+      args:
+        executable: /bin/bash
